@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Moog OSC Worklet example</title>
+    <style>
+        body { 
+            font-family: system-ui;
+            max-width: 800px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+        }
+        button {
+            padding: 0.5rem 1rem;
+            margin: 0.5rem;
+        }
+        #status {
+            margin: 1rem 0;
+            padding: 1rem;
+            border-radius: 4px;
+        }
+        .active {
+            background: #e6ffe6;
+        }
+        .inactive {
+            background: #ffe6e6;
+        }
+    </style>
+</head>
+<body>
+    <h1>VCO Audio Worklet Demo</h1>
+    <p>Demonstrating phaseshaping oscillator algorithms from the paper.</p>
+    
+    <div id="status" class="inactive">Audio context not initialized</div>
+    
+    <button id="startBtn">Start Audio</button>
+    <button id="stopBtn" disabled>Stop Audio</button>
+
+    <script>
+        // Audio Worklet processor code as a string
+        const processorCode = `
+            class WaveformGenerator {
+                constructor(sampleRate, detuneAmount = 0) {
+                    this.phase = 0;
+                    this.sampleRate = sampleRate;
+                    this.frequency = 440;
+                    this.detuneAmount = detuneAmount; // Detune in cents
+                }
+
+                // Implementation of polyBLEP antialiasing from the paper
+                polyBlep(t, dt) {
+                    if (t < dt) {
+                        t = t/dt;
+                        return t + t - t*t - 1;
+                    } else if (t > 1 - dt) {
+                        t = (t - 1)/dt;
+                        return t*t + t + t + 1;
+                    }
+                    return 0;
+                }
+
+                // Generate one sample of the antialiased sawtooth
+                generate() {
+                    const dt = this.frequency/this.sampleRate;
+                    let value = (2.0 * this.phase - 1.0);
+                    
+                    // Add polyBLEP correction at discontinuities
+                    value -= this.polyBlep(this.phase, dt);
+                    
+                    // Increment and wrap phase
+                    this.phase += dt;
+                    if (this.phase >= 1) this.phase -= 1;
+                    
+                    return value;
+                }
+
+                setFrequency(freq) {
+                    // Apply detune
+                    const detuneMultiplier = Math.pow(2, this.detuneAmount / 1200); // Convert cents to multiplier
+                    this.frequency = freq * detuneMultiplier;
+                }
+            }
+
+            class VCOProcessor extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    // Create 4 oscillators with different detune values
+                    this.generators = [
+                        new WaveformGenerator(sampleRate, 0),      // Center
+                        new WaveformGenerator(sampleRate, -12),    // Slightly flat
+                        new WaveformGenerator(sampleRate, 8),      // Slightly sharp
+                        new WaveformGenerator(sampleRate, -20)     // More flat
+                    ];
+                    this.isPlaying = false;
+                    
+                    this.port.onmessage = (e) => {
+                        if (e.data.type === 'noteOn') {
+                            const freq = 440 * Math.pow(2, (e.data.note - 69) / 12);
+                            this.generators.forEach(gen => gen.setFrequency(freq));
+                            this.isPlaying = true;
+                        } else if (e.data.type === 'noteOff') {
+                            this.isPlaying = false;
+                        }
+                    };
+                }
+
+                process(inputs, outputs) {
+                    const output = outputs[0];
+                    const channel = output[0];
+                    
+                    if (this.isPlaying) {
+                        for (let i = 0; i < channel.length; i++) {
+                            // Mix all oscillators with equal weight
+                            channel[i] = this.generators.reduce((sum, gen) => {
+                                return sum + gen.generate();
+                            }, 0) * 0.15; // Reduced amplitude further due to multiple oscillators
+                        }
+                    } else {
+                        for (let i = 0; i < channel.length; i++) {
+                            channel[i] = 0;
+                        }
+                    }
+                    return true;
+                }
+            }
+
+            registerProcessor('vco-processor', VCOProcessor);
+        `;
+
+        // Main script
+        let audioContext;
+        let vcoNode;
+        const statusDiv = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        async function initAudio() {
+            try {
+                audioContext = new AudioContext();
+                const blob = new Blob([processorCode], { type: 'application/javascript' });
+                const url = URL.createObjectURL(blob);
+                await audioContext.audioWorklet.addModule(url);
+                
+                vcoNode = new AudioWorkletNode(audioContext, 'vco-processor');
+                vcoNode.connect(audioContext.destination);
+                
+                statusDiv.textContent = 'Audio initialized and running';
+                statusDiv.className = 'active';
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+
+                // Start playing random notes
+                playRandomNotes();
+            } catch (err) {
+                console.error('Error initializing audio:', err);
+                statusDiv.textContent = 'Error initializing audio: ' + err.message;
+            }
+        }
+
+        function stopAudio() {
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+                vcoNode = null;
+                statusDiv.textContent = 'Audio stopped';
+                statusDiv.className = 'inactive';
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+        }
+
+        function playRandomNotes() {
+            if (!vcoNode) return;
+            
+            const notes = [60, 62, 64, 65, 67, 69, 71, 72]; // C4 to C5 major scale
+            let index = 0;
+            
+            function playNextNote() {
+                if (!vcoNode) return;
+                
+                // Stop previous note
+                vcoNode.port.postMessage({type: 'noteOff'});
+                
+                // Play new note
+                const note = notes[index];
+                vcoNode.port.postMessage({type: 'noteOn', note});
+                
+                // Schedule next note
+                index = (index + 1) % notes.length;
+                setTimeout(() => {
+                    playNextNote();
+                }, 500); // Play a new note every 500ms
+            }
+            
+            playNextNote();
+        }
+
+        startBtn.addEventListener('click', initAudio);
+        stopBtn.addEventListener('click', stopAudio);
+    </script>
+</body>
+</html>
